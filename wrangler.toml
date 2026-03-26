@@ -1,0 +1,30 @@
+name = "echo-recruiting"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-recruiting"
+database_id = "860241e2-5682-42dc-aaf9-e2c8a8b15821"
+
+[[kv_namespaces]]
+binding = "RC_CACHE"
+id = "a1b6e0042e2848d894d2924ac43b456b"
+
+[triggers]
+crons = ["0 8 * * 1"]
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"
