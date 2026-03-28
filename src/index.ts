@@ -1,8 +1,10 @@
 /**
- * Echo Recruiting v1.0.0
+ * Echo Recruiting v2.0.0
  * AI-Powered Applicant Tracking System — Greenhouse/Lever Alternative
- * Cloudflare Worker — D1 + KV
+ * Cloudflare Worker — D1 + KV + Stripe Payments
  */
+
+const VERSION = '2.0.0';
 
 interface Env {
   DB: D1Database;
@@ -11,6 +13,65 @@ interface Env {
   SHARED_BRAIN: Fetcher;
   EMAIL_SENDER: Fetcher;
   ECHO_API_KEY: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+}
+
+/* ── Stripe Helpers ── */
+const STRIPE_API = 'https://api.stripe.com/v1';
+
+const PLANS = {
+  free:       { name: 'Free',       price_cents: 0,     max_jobs: 3,   featured: false, analytics: false },
+  pro:        { name: 'Pro',        price_cents: 4900,   max_jobs: 25,  featured: true,  analytics: false },
+  enterprise: { name: 'Enterprise', price_cents: 14900,  max_jobs: -1,  featured: true,  analytics: true  },
+} as const;
+type PlanTier = keyof typeof PLANS;
+
+const FEATURED_BOOST_CENTS = 1999;
+
+async function stripeRequest(env: Env, path: string, params: Record<string, string>, method = 'POST'): Promise<any> {
+  const body = new URLSearchParams(params);
+  const resp = await fetch(`${STRIPE_API}${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: method === 'GET' ? undefined : body.toString(),
+  });
+  return resp.json();
+}
+
+async function verifyStripeSignature(req: Request, secret: string): Promise<{ valid: boolean; payload?: any }> {
+  const sigHeader = req.headers.get('stripe-signature');
+  if (!sigHeader) return { valid: false };
+
+  const bodyText = await req.text();
+  const parts: Record<string, string> = {};
+  for (const item of sigHeader.split(',')) {
+    const [k, v] = item.split('=');
+    parts[k.trim()] = v.trim();
+  }
+  const timestamp = parts['t'];
+  const sig = parts['v1'];
+  if (!timestamp || !sig) return { valid: false };
+
+  // 5-minute replay window
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (age > 300) return { valid: false };
+
+  const signedPayload = `${timestamp}.${bodyText}`;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signedPayload));
+  const expected = Array.from(new Uint8Array(mac)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // Constant-time compare
+  if (expected.length !== sig.length) return { valid: false };
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
+  if (diff !== 0) return { valid: false };
+
+  return { valid: true, payload: JSON.parse(bodyText) };
 }
 
 interface RLState { c: number; t: number }
@@ -28,7 +89,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-recruiting', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-recruiting', version: VERSION, msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
 }
@@ -58,15 +119,15 @@ export default {
 
     try {
       /* ── Public Endpoints ── */
-      if (p === '/') return json({ name: 'echo-recruiting', status: 'ok', version: '1.0.0', docs: '/health', timestamp: new Date().toISOString() });
-      if (p === '/health') return json({ status: 'ok', service: 'echo-recruiting', version: '1.0.0', timestamp: new Date().toISOString() });
+      if (p === '/') return json({ name: 'echo-recruiting', status: 'ok', version: VERSION, docs: '/health', timestamp: new Date().toISOString() });
+      if (p === '/health') return json({ status: 'ok', service: 'echo-recruiting', version: VERSION, stripe: !!env.STRIPE_SECRET_KEY, plans: Object.keys(PLANS), featured_boost_price: `$${FEATURED_BOOST_CENTS / 100}`, timestamp: new Date().toISOString() });
 
       // Public careers page — list open jobs for a company
       if (p.match(/^\/careers\/([a-z0-9-]+)$/) && m === 'GET') {
         const slug = p.split('/')[2];
         const co = await env.DB.prepare('SELECT id, name, logo_url, website, careers_page FROM companies WHERE slug=? AND status=?').bind(slug, 'active').first() as any;
         if (!co) return json({ error: 'company not found' }, 404);
-        const jobs = await env.DB.prepare('SELECT id, title, slug, location, location_type, employment_type, salary_min, salary_max, salary_currency, experience_level, skills, benefits, description, published_at FROM jobs WHERE company_id=? AND status=? AND is_public=1 ORDER BY published_at DESC').bind(co.id, 'open').all();
+        const jobs = await env.DB.prepare('SELECT id, title, slug, location, location_type, employment_type, salary_min, salary_max, salary_currency, experience_level, skills, benefits, description, published_at, is_featured, featured_until FROM jobs WHERE company_id=? AND status=? AND is_public=1 ORDER BY (CASE WHEN is_featured=1 AND featured_until > datetime(\'now\') THEN 0 ELSE 1 END), published_at DESC').bind(co.id, 'open').all();
         return json({ company: { name: co.name, logo_url: co.logo_url, website: co.website }, jobs: jobs.results });
       }
 
@@ -107,6 +168,72 @@ export default {
         const r = await env.DB.prepare('INSERT INTO applications (job_id,candidate_id,company_id,cover_letter,answers,referred_by) VALUES (?,?,?,?,?,?)').bind(job.id, cand.id, co.id, sanitize(b.cover_letter || '', 10000), b.answers ? JSON.stringify(b.answers) : '[]', sanitize(b.referred_by || '', 100)).run();
         await env.DB.prepare("INSERT INTO activity_log (company_id,action,target,details) VALUES (?,?,?,?)").bind(co.id, 'application_received', `job:${job.id}`, `${firstName} ${lastName} (${email})`).run();
         return json({ application_id: r.meta.last_row_id, message: 'Application submitted successfully' });
+      }
+
+      /* ── Stripe Webhook (NO auth, signature-verified) ── */
+      if (p === '/webhooks/stripe' && m === 'POST') {
+        if (!env.STRIPE_WEBHOOK_SECRET) return json({ error: 'stripe webhooks not configured' }, 503);
+        const { valid, payload } = await verifyStripeSignature(req, env.STRIPE_WEBHOOK_SECRET);
+        if (!valid) { slog('warn', 'Invalid Stripe signature'); return json({ error: 'invalid signature' }, 400); }
+        const event = payload;
+        slog('info', 'Stripe webhook received', { type: event.type, id: event.id });
+
+        if (event.type === 'checkout.session.completed') {
+          const session = event.data.object;
+          const meta = session.metadata || {};
+          const companyId = meta.company_id;
+
+          if (meta.type === 'plan_upgrade' && companyId && meta.plan) {
+            const plan = meta.plan as PlanTier;
+            const planInfo = PLANS[plan];
+            if (planInfo) {
+              await env.DB.prepare("UPDATE companies SET plan=?, stripe_customer_id=?, stripe_subscription_id=?, max_active_jobs=?, updated_at=datetime('now') WHERE id=?")
+                .bind(plan, session.customer || '', session.subscription || '', planInfo.max_jobs, companyId).run();
+              await env.DB.prepare("INSERT INTO stripe_events (stripe_event_id,event_type,company_id,amount_cents,currency,metadata) VALUES (?,?,?,?,?,?)")
+                .bind(event.id, event.type, companyId, session.amount_total || planInfo.price_cents, session.currency || 'usd', JSON.stringify(meta)).run();
+              await env.DB.prepare("INSERT INTO activity_log (company_id,action,target,details) VALUES (?,?,?,?)")
+                .bind(companyId, 'plan_upgraded', `plan:${plan}`, `Upgraded to ${planInfo.name} ($${planInfo.price_cents / 100}/mo)`).run();
+              slog('info', 'Plan upgraded via Stripe', { company_id: companyId, plan });
+            }
+          } else if (meta.type === 'featured_boost' && meta.job_id && companyId) {
+            await env.DB.prepare("UPDATE jobs SET is_featured=1, featured_until=datetime('now','+30 days'), updated_at=datetime('now') WHERE id=? AND company_id=?")
+              .bind(meta.job_id, companyId).run();
+            await env.DB.prepare("INSERT INTO stripe_events (stripe_event_id,event_type,company_id,amount_cents,currency,metadata) VALUES (?,?,?,?,?,?)")
+              .bind(event.id, event.type, companyId, FEATURED_BOOST_CENTS, session.currency || 'usd', JSON.stringify(meta)).run();
+            await env.DB.prepare("INSERT INTO activity_log (company_id,action,target,details) VALUES (?,?,?,?)")
+              .bind(companyId, 'job_featured', `job:${meta.job_id}`, `Featured boost purchased ($${FEATURED_BOOST_CENTS / 100})`).run();
+            slog('info', 'Job featured via Stripe', { company_id: companyId, job_id: meta.job_id });
+          }
+        }
+
+        if (event.type === 'customer.subscription.deleted' || event.type === 'customer.subscription.updated') {
+          const sub = event.data.object;
+          const companyRow = await env.DB.prepare("SELECT id FROM companies WHERE stripe_subscription_id=?").bind(sub.id).first() as any;
+          if (companyRow) {
+            if (event.type === 'customer.subscription.deleted' || sub.status === 'canceled' || sub.status === 'unpaid') {
+              await env.DB.prepare("UPDATE companies SET plan='free', max_active_jobs=3, stripe_subscription_id=NULL, updated_at=datetime('now') WHERE id=?").bind(companyRow.id).run();
+              await env.DB.prepare("INSERT INTO activity_log (company_id,action,target,details) VALUES (?,?,?,?)")
+                .bind(companyRow.id, 'plan_downgraded', 'plan:free', 'Subscription canceled — reverted to Free').run();
+              slog('info', 'Subscription canceled, downgraded to free', { company_id: companyRow.id });
+            }
+          }
+          await env.DB.prepare("INSERT INTO stripe_events (stripe_event_id,event_type,company_id,amount_cents,currency,metadata) VALUES (?,?,?,?,?,?)")
+            .bind(event.id, event.type, companyRow?.id || '', 0, 'usd', JSON.stringify(sub.metadata || {})).run();
+        }
+
+        if (event.type === 'invoice.payment_failed') {
+          const invoice = event.data.object;
+          const companyRow = await env.DB.prepare("SELECT id FROM companies WHERE stripe_customer_id=?").bind(invoice.customer).first() as any;
+          if (companyRow) {
+            await env.DB.prepare("INSERT INTO activity_log (company_id,action,target,details) VALUES (?,?,?,?)")
+              .bind(companyRow.id, 'payment_failed', `invoice:${invoice.id}`, 'Payment failed — action required').run();
+            slog('warn', 'Payment failed', { company_id: companyRow.id, invoice_id: invoice.id });
+          }
+          await env.DB.prepare("INSERT INTO stripe_events (stripe_event_id,event_type,company_id,amount_cents,currency,metadata) VALUES (?,?,?,?,?,?)")
+            .bind(event.id, event.type, companyRow?.id || '', invoice.amount_due || 0, invoice.currency || 'usd', '{}').run();
+        }
+
+        return json({ received: true });
       }
 
       /* ── Auth Required ── */
@@ -534,6 +661,152 @@ export default {
           return new Response(csv, { headers: { 'Content-Type': 'text/csv', 'Content-Disposition': `attachment; filename="recruiting-${coId}.csv"`, 'Access-Control-Allow-Origin': '*' } });
         }
         return json({ jobs: jobs.results, candidates: candidates.results, applications: apps.results, exported_at: new Date().toISOString() });
+      }
+
+      /* ═══ STRIPE PAYMENTS ═══ */
+      // Feature/boost a job listing — creates Stripe Checkout
+      if (p.match(/^\/jobs\/(\d+)\/feature$/) && m === 'POST') {
+        if (!env.STRIPE_SECRET_KEY) return json({ error: 'payments not configured' }, 503);
+        const jobId = p.split('/')[2];
+        const job = await db.prepare('SELECT id, title, company_id FROM jobs WHERE id=?').bind(jobId).first() as any;
+        if (!job) return json({ error: 'job not found' }, 404);
+        const company = await db.prepare('SELECT id, name, plan FROM companies WHERE id=?').bind(job.company_id).first() as any;
+        if (!company) return json({ error: 'company not found' }, 404);
+
+        const b = await req.json().catch(() => ({})) as any;
+        const successUrl = sanitize(b.success_url || 'https://echo-prime.tech/recruiting/success', 500);
+        const cancelUrl = sanitize(b.cancel_url || 'https://echo-prime.tech/recruiting/cancel', 500);
+
+        const session = await stripeRequest(env, '/checkout/sessions', {
+          'mode': 'payment',
+          'line_items[0][price_data][currency]': 'usd',
+          'line_items[0][price_data][unit_amount]': String(FEATURED_BOOST_CENTS),
+          'line_items[0][price_data][product_data][name]': `Featured Boost: ${job.title}`,
+          'line_items[0][price_data][product_data][description]': '30-day featured placement for your job listing',
+          'line_items[0][quantity]': '1',
+          'metadata[type]': 'featured_boost',
+          'metadata[job_id]': String(jobId),
+          'metadata[company_id]': String(job.company_id),
+          'success_url': successUrl,
+          'cancel_url': cancelUrl,
+        });
+
+        if (session.error) {
+          slog('error', 'Stripe checkout failed', { error: session.error.message });
+          return json({ error: 'Payment session creation failed', detail: session.error.message }, 502);
+        }
+        slog('info', 'Featured boost checkout created', { job_id: jobId, session_id: session.id });
+        return json({ checkout_url: session.url, session_id: session.id, amount: '$19.99' });
+      }
+
+      // Plan upgrade — creates Stripe Checkout for subscription
+      if (p === '/plans/upgrade' && m === 'POST') {
+        if (!env.STRIPE_SECRET_KEY) return json({ error: 'payments not configured' }, 503);
+        const b = await req.json() as any;
+        const companyId = b.company_id;
+        const plan = b.plan as PlanTier;
+        if (!companyId || !plan || !PLANS[plan] || plan === 'free') {
+          return json({ error: 'company_id and plan (pro|enterprise) required' }, 400);
+        }
+        const company = await db.prepare('SELECT id, name, plan as current_plan, stripe_customer_id FROM companies WHERE id=?').bind(companyId).first() as any;
+        if (!company) return json({ error: 'company not found' }, 404);
+        if (company.current_plan === plan) return json({ error: 'already on this plan' }, 400);
+
+        const planInfo = PLANS[plan];
+        const successUrl = sanitize(b.success_url || 'https://echo-prime.tech/recruiting/success', 500);
+        const cancelUrl = sanitize(b.cancel_url || 'https://echo-prime.tech/recruiting/cancel', 500);
+
+        const params: Record<string, string> = {
+          'mode': 'subscription',
+          'line_items[0][price_data][currency]': 'usd',
+          'line_items[0][price_data][unit_amount]': String(planInfo.price_cents),
+          'line_items[0][price_data][recurring][interval]': 'month',
+          'line_items[0][price_data][product_data][name]': `Echo Recruiting ${planInfo.name} Plan`,
+          'line_items[0][price_data][product_data][description]': `${planInfo.max_jobs === -1 ? 'Unlimited' : planInfo.max_jobs} active job posts${planInfo.featured ? ' + featured placement' : ''}${planInfo.analytics ? ' + analytics' : ''}`,
+          'line_items[0][quantity]': '1',
+          'metadata[type]': 'plan_upgrade',
+          'metadata[company_id]': String(companyId),
+          'metadata[plan]': plan,
+          'success_url': successUrl,
+          'cancel_url': cancelUrl,
+        };
+        if (company.stripe_customer_id) {
+          params['customer'] = company.stripe_customer_id;
+        }
+
+        const session = await stripeRequest(env, '/checkout/sessions', params);
+        if (session.error) {
+          slog('error', 'Stripe plan upgrade failed', { error: session.error.message });
+          return json({ error: 'Payment session creation failed', detail: session.error.message }, 502);
+        }
+        slog('info', 'Plan upgrade checkout created', { company_id: companyId, plan, session_id: session.id });
+        return json({ checkout_url: session.url, session_id: session.id, plan: planInfo.name, price: `$${planInfo.price_cents / 100}/mo` });
+      }
+
+      // List plans
+      if (p === '/plans' && m === 'GET') {
+        return json({
+          plans: Object.entries(PLANS).map(([tier, info]) => ({
+            tier, ...info, price: info.price_cents === 0 ? 'Free' : `$${info.price_cents / 100}/mo`,
+          })),
+          featured_boost: { price_cents: FEATURED_BOOST_CENTS, price: `$${FEATURED_BOOST_CENTS / 100}`, description: '30-day featured placement per listing' },
+        });
+      }
+
+      // Company billing info
+      if (p.match(/^\/billing\/(\d+)$/) && m === 'GET') {
+        const coId = p.split('/')[2];
+        const co = await db.prepare('SELECT id, name, plan, stripe_customer_id, stripe_subscription_id, max_active_jobs FROM companies WHERE id=?').bind(coId).first() as any;
+        if (!co) return json({ error: 'company not found' }, 404);
+        const activeJobs = await db.prepare("SELECT COUNT(*) as cnt FROM jobs WHERE company_id=? AND status='open'").bind(coId).first() as any;
+        const featuredJobs = await db.prepare("SELECT COUNT(*) as cnt FROM jobs WHERE company_id=? AND is_featured=1 AND featured_until > datetime('now')").bind(coId).first() as any;
+        const events = await db.prepare("SELECT * FROM stripe_events WHERE company_id=? ORDER BY created_at DESC LIMIT 20").bind(coId).all();
+        const planInfo = PLANS[(co.plan || 'free') as PlanTier] || PLANS.free;
+        return json({
+          plan: co.plan || 'free',
+          plan_details: planInfo,
+          stripe_customer_id: co.stripe_customer_id,
+          active_jobs: activeJobs?.cnt || 0,
+          max_active_jobs: co.max_active_jobs || 3,
+          featured_jobs: featuredJobs?.cnt || 0,
+          recent_events: events.results,
+        });
+      }
+
+      // Admin: Stripe schema migration
+      if (p === '/admin/migrate-stripe' && m === 'POST') {
+        const stmts = [
+          `ALTER TABLE companies ADD COLUMN plan TEXT DEFAULT 'free'`,
+          `ALTER TABLE companies ADD COLUMN stripe_customer_id TEXT DEFAULT ''`,
+          `ALTER TABLE companies ADD COLUMN stripe_subscription_id TEXT DEFAULT ''`,
+          `ALTER TABLE companies ADD COLUMN max_active_jobs INTEGER DEFAULT 3`,
+          `ALTER TABLE jobs ADD COLUMN is_featured INTEGER DEFAULT 0`,
+          `ALTER TABLE jobs ADD COLUMN featured_until TEXT`,
+          `CREATE TABLE IF NOT EXISTS stripe_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stripe_event_id TEXT UNIQUE NOT NULL,
+            event_type TEXT NOT NULL,
+            company_id TEXT,
+            amount_cents INTEGER DEFAULT 0,
+            currency TEXT DEFAULT 'usd',
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now'))
+          )`,
+          `CREATE INDEX IF NOT EXISTS idx_stripe_events_company ON stripe_events(company_id)`,
+          `CREATE INDEX IF NOT EXISTS idx_stripe_events_type ON stripe_events(event_type)`,
+          `CREATE INDEX IF NOT EXISTS idx_jobs_featured ON jobs(is_featured, featured_until)`,
+        ];
+        const results: { sql: string; ok: boolean; error?: string }[] = [];
+        for (const sql of stmts) {
+          try {
+            await db.prepare(sql).run();
+            results.push({ sql: sql.slice(0, 60) + '...', ok: true });
+          } catch (e: any) {
+            results.push({ sql: sql.slice(0, 60) + '...', ok: false, error: e.message });
+          }
+        }
+        slog('info', 'Stripe migration executed', { results: results.length, ok: results.filter(r => r.ok).length });
+        return json({ migrated: true, results });
       }
 
       /* ═══ STATS ═══ */
