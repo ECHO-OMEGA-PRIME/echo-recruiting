@@ -58,6 +58,7 @@ export default {
 
     try {
       /* ── Public Endpoints ── */
+      if (p === '/') return json({ service: 'echo-recruiting', version: '1.0.0', status: 'operational' });
       if (p === '/health') return json({ status: 'ok', service: 'echo-recruiting', version: '1.0.0', timestamp: new Date().toISOString() });
 
       // Public careers page — list open jobs for a company
