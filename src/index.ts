@@ -550,9 +550,13 @@ export default {
         return json({ activity: r.results });
       }
 
-      return json({ error: 'not found' }, 404);
+      return json({ error: 'Not found', path: p }, 404);
     } catch (e: any) {
-      return json({ error: e.message || 'internal error' }, 500);
+      if (e.message?.includes('JSON')) {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+      console.error(`[echo-recruiting] Unhandled error: ${e.message}`);
+      return json({ error: 'Internal server error' }, 500);
     }
   },
 
